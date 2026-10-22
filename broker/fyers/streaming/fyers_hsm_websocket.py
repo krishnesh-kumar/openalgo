@@ -376,6 +376,12 @@ class FyersHSMWebSocket:
                 # healthy connection that then never delivers a tick.
                 if not self._auth_response_ok(data):
                     self.authenticated = False
+                    # Remember WHICH key was refused. The reconnect loop backs off
+                    # while the database still holds the same key: on 2026-10-22
+                    # this loop retried every 5 s per adapter for six hours -
+                    # 487,170 rejections, a 1.7 GB log, 400+ threads, and the
+                    # same account's REST calls throttled with 429 (O96/O97).
+                    self._rejected_hsm_key = self.hsm_key
                     self.logger.error(
                         "HSM authentication rejected by Fyers - the access token's "
                         "hsm_key was not accepted (re-authenticate the broker)"
@@ -972,10 +978,33 @@ class FyersHSMWebSocket:
                 # reuse the dead construction-time token and the feed would stay
                 # dead until a process restart.
                 self._refresh_access_token()
+                self._back_off_while_key_still_rejected()
             else:
                 break
 
         self.logger.debug("HSM WebSocket run loop exited")
+
+    # Seconds to wait between attempts while the key Fyers refused is still the
+    # key in the database. Doubles per attempt, capped. A fresh login replaces
+    # the key and the next attempt is immediate.
+    REJECTED_KEY_BACKOFF_START = 30
+    REJECTED_KEY_BACKOFF_MAX = 300
+
+    def _back_off_while_key_still_rejected(self) -> None:
+        rejected = getattr(self, "_rejected_hsm_key", None)
+        if not rejected or self.hsm_key != rejected:
+            self._rejected_backoff = 0
+            return
+        n = getattr(self, "_rejected_backoff", 0)
+        delay = min(self.REJECTED_KEY_BACKOFF_START * (2 ** n), self.REJECTED_KEY_BACKOFF_MAX)
+        self._rejected_backoff = n + 1
+        self.logger.warning(
+            f"HSM key still the one Fyers rejected; not retrying for {delay}s "
+            f"(re-authenticate the broker to reset)"
+        )
+        end = time.time() + delay
+        while self.running and time.time() < end:
+            time.sleep(1)
 
     def _refresh_access_token(self):
         """Re-read a fresh access token from the database before a reconnect.
