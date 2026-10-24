@@ -142,6 +142,13 @@ class SquareOffManager:
 
                     # Check if current time has passed square-off time
                     if current_time >= square_off_time:
+                        resting = self._resting_close_order(position)
+                        if resting:
+                            logger.info(
+                                f"Square-off: {position.symbol} already has close order {resting} "
+                                f"resting; not placing another"
+                            )
+                            continue
                         positions_to_close.append(position)
             else:
                 logger.debug("No MIS positions to square-off")
@@ -175,6 +182,33 @@ class SquareOffManager:
 
         except Exception as e:
             logger.exception(f"Error checking square-off conditions: {e}")
+
+    def _resting_close_order(self, position):
+        """The orderid of an order that already closes this position and is
+        still resting, else None.
+
+        A close order rests when no quote is available to fill it. Without
+        this check the sweep placed a fresh close order for the same position
+        on every run while the earlier one could not be cancelled either: 641
+        duplicates on one account on 2026-10-22, every one of which would
+        have filled on the first quote and flipped the position many times
+        over. One resting close per position is what a real exchange holds.
+        """
+        from database.sandbox_db import SandboxOrders
+
+        side = "SELL" if position.quantity > 0 else "BUY"
+        order = (
+            SandboxOrders.query.filter_by(
+                user_id=position.user_id,
+                symbol=position.symbol,
+                exchange=position.exchange,
+                product=position.product,
+                action=side,
+            )
+            .filter(SandboxOrders.order_status.in_(["open", "trigger pending"]))
+            .first()
+        )
+        return order.orderid if order else None
 
     def _cancel_expired_contract_orders(self):
         """Cancel open orders whose F&O contract has expired.
