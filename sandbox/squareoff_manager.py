@@ -194,21 +194,27 @@ class SquareOffManager:
         have filled on the first quote and flipped the position many times
         over. One resting close per position is what a real exchange holds.
         """
-        from database.sandbox_db import SandboxOrders
+        # A failure in this guard must never stop the square-off itself: the
+        # sweep's outer try would otherwise skip every position for the day.
+        try:
+            from database.sandbox_db import SandboxOrders
 
-        side = "SELL" if position.quantity > 0 else "BUY"
-        order = (
-            SandboxOrders.query.filter_by(
-                user_id=position.user_id,
-                symbol=position.symbol,
-                exchange=position.exchange,
-                product=position.product,
-                action=side,
+            side = "SELL" if position.quantity > 0 else "BUY"
+            order = (
+                SandboxOrders.query.filter_by(
+                    user_id=position.user_id,
+                    symbol=position.symbol,
+                    exchange=position.exchange,
+                    product=position.product,
+                    action=side,
+                )
+                .filter(SandboxOrders.order_status.in_(["open", "trigger pending"]))
+                .first()
             )
-            .filter(SandboxOrders.order_status.in_(["open", "trigger pending"]))
-            .first()
-        )
-        return order.orderid if order else None
+            return order.orderid if order else None
+        except Exception as e:
+            logger.exception(f"Could not check for a resting close order on {position.symbol}: {e}")
+            return None
 
     def _cancel_expired_contract_orders(self):
         """Cancel open orders whose F&O contract has expired.
