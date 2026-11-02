@@ -1,12 +1,23 @@
 """
 Shared rate limiting and 429-retry helpers for all Fyers API calls.
 
-Fyers enforces a single global cap per API key across every REST endpoint --
-order, data, quotes, depth, history, funds: 10 requests/second, 200/minute,
-100000/day (see fyers-api-docs/FYERS_API_v3.md -> "Rate Limits"). Unlike Dhan,
-which has independent per-endpoint-class limits (charts vs marketfeed), Fyers'
-10 req/sec budget is shared process-wide, so pacing state MUST live in one
-place that every module importing it sees -- not per BrokerData instance.
+TWO BUCKETS, NOT ONE (corrected 2026-11-02). This docstring used to say Fyers
+enforces "a single global cap per API key across every REST endpoint -- order,
+data, quotes, depth, history, funds: 10 requests/second, 200/minute,
+100000/day". Those are the TRANSACTION API's limits. The DATA API - anything
+under /data/, so quotes, depth and history - allows 5 requests/second,
+50/minute and 5,000/day on the Standard plan, and more than three per-minute
+breaches in one day can block it for the rest of the day. Pacing data calls
+against the transaction numbers is why Fyers answered 429 on every session
+from 2026-10-22 (71 events over seven days; 25 of them on 29 Oct).
+
+The process-wide pace below stays as it was, and a second guard now applies to
+data calls only: `shared_data_budget`, an account-wide window in a file that
+every process on this machine shares. It is the only place that sees the sum
+of the bot's quotes, the OI collector's and the sandbox's own mark-to-market
+polls, so it is the only honest counter of what this API key actually spends.
+It is switched on by the OPENALGO_SHARED_DATA_BUDGET environment variable and
+does nothing at all when that is unset.
 
 Services create a fresh BrokerData(auth_token) per request (see
 services/option_chain_service.py, services/oi_tracker_service.py, etc.), so
@@ -19,6 +30,7 @@ routinely exceeding the real 10 req/sec cap and getting HTTP 429'd.
 import threading
 import time
 
+from broker.fyers.api import shared_data_budget
 from utils.broker_backpressure import BrokerBusyError, cap_server_delay, check_queue_wait
 
 _lock = threading.Lock()
@@ -33,7 +45,7 @@ MAX_RETRIES = 3
 BASE_BACKOFF = 1.0  # seconds; exponential fallback when no Retry-After header: 1, 2, 4
 
 
-def apply_rate_limit(kind="data"):
+def apply_rate_limit(kind="data", endpoint=None):
     """Block the calling thread until it is safe to make another Fyers API call.
 
     Shared process-wide (module-level lock + timestamp) so every caller
@@ -48,6 +60,11 @@ def apply_rate_limit(kind="data"):
 
     Args:
         kind: ``"data"``, or ``"order"`` for order placement and changes.
+        endpoint: the Fyers path about to be called. One under ``/data/`` is a
+            DATA API call and is additionally paced and counted against the
+            account-wide window (see ``shared_data_budget``); anything else is
+            the Transaction API and is left to the process-wide pace alone.
+            Passing nothing keeps the old behaviour exactly.
 
     Raises:
         BrokerBusyError: Under gthread, when the slot is too far away.
@@ -62,6 +79,10 @@ def apply_rate_limit(kind="data"):
 
     if sleep_time > 0:
         time.sleep(sleep_time)
+
+    # The account-wide guard, data calls only. Fails open: a broken window
+    # never stops a call (shared_data_budget's docstring says why).
+    shared_data_budget.pace_data_call(endpoint)
 
 
 def retry_delay_from_headers(headers, attempt, kind="data"):

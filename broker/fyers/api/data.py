@@ -46,7 +46,7 @@ def get_api_response(endpoint, auth, method="GET", payload="", _retry_count=0):
         url = f"https://api-t1.fyers.in{endpoint}"
         headers = {"Authorization": f"{api_key}:{AUTH_TOKEN}", "Content-Type": "application/json"}
 
-        apply_rate_limit()
+        apply_rate_limit(endpoint=endpoint)
 
         logger.debug(f"Making {method} request to Fyers API: {url}")
 
